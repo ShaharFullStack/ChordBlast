@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Hand-Controlled Synthesizer with Three.js</title>
+  <title>Chord Blast</title>
   <style>
     body {
       margin: 0;
@@ -87,7 +87,7 @@
   <canvas class="spectrum"></canvas>
   <div class="cursor"></div>
   <div class="instructions">
-    <h2>Synthesizer with Three.js Particles</h2>
+    <h1>Chord Blast</h1>
     <p>Show your hand to the camera to control the sound</p>
     <p>Move your index finger to change the sound</p>
     <p>Make a fist to play the sound, open hand to stop</p>
@@ -139,7 +139,7 @@
       const videoElement = document.getElementById('camera-feed');
 
       // Global variables for motion control
-      const mousePos = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+      const mousePos = { x: window.innerWidth / 1, y: window.innerHeight / 2 };
       const interpolated = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
       const distance = { x: 0, y: 0 };
       let isHandVisible = false;
