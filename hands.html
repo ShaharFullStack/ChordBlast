@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Hand-Controlled Synthesizer with Three.js</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      height: 100vh;
+      width: 100vw;
+      background-color: #111;
+      font-family: Arial, sans-serif;
+    }
+    #visualizer-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+    .instructions {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      padding: 15px;
+      background: rgba(0,0,0,0.6);
+      color: white;
+      border-radius: 10px;
+      font-size: 16px;
+      z-index: 100;
+      text-align: left;
+    }
+    .status {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      padding: 10px;
+      background: rgba(0,0,0,0.6);
+      color: white;
+      border-radius: 5px;
+      font-size: 14px;
+      z-index: 100;
+      text-align: left;
+    }
+    .spectrum {
+      display: none; /* Hide the spectrum canvas, as we will use Three.js for visualization */
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      width: 300px;
+      height: 80px;
+      background: rgba(0,0,0,0.4);
+      border-radius: 5px;
+      z-index: 50;
+    }
+    .cursor {
+      position: absolute;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: rgba(255, 0, 0, 0.5);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      z-index: 200;
+      transition: box-shadow 0.1s;
+      display: none; /* Hide the cursor, as we'll use Three.js instead */
+    }
+    #camera-feed {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      width: 160px;
+      height: 120px;
+      border-radius: 8px;
+      z-index: 100;
+      transform: scaleX(-1); /* Mirror the camera feed */
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="visualizer-container"></div>
+  <video id="camera-feed" autoplay playsinline></video>
+  <canvas class="spectrum"></canvas>
+  <div class="cursor"></div>
+  <div class="instructions">
+    <h2>Synthesizer with Three.js Particles</h2>
+    <p>Show your hand to the camera to control the sound</p>
+    <p>Move your index finger to change the sound</p>
+    <p>Make a fist to play the sound, open hand to stop</p>
+  </div>
+  <div class="status">Show your hand to activate audio</div>
+
+  <script>
+    // Load Three.js first
+    async function loadDependencies() {
+      // Load Three.js
+      await loadScript('https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.min.js');
+      
+      // Load MediaPipe scripts
+      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
+      
+      // Initialize everything after scripts are loaded
+      initializeApp();
+    }
+
+    // Helper to load scripts
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = src;
+        script.crossOrigin = 'anonymous';
+        script.onload = resolve;
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+    }
+
+    // Start loading dependencies
+    loadDependencies().catch(err => {
+      console.error("Failed to load dependencies:", err);
+      document.querySelector('.status').textContent = "Error loading dependencies: " + err.message;
+    });
+
+    // The main app initialization
+    function initializeApp() {
+      // Basic setup
+      const container = document.getElementById('visualizer-container');
+      const cursor = document.querySelector('.cursor');
+      const spectrum = document.querySelector('.spectrum');
+      const instructions = document.querySelector('.instructions');
+      const statusDiv = document.querySelector('.status');
+      const videoElement = document.getElementById('camera-feed');
+
+      // Global variables for motion control
+      const mousePos = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+      const interpolated = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+      const distance = { x: 0, y: 0 };
+      let isHandVisible = false;
+      let isHandClosed = false;
+      
+      // Three.js variables
+      let scene, camera, renderer, particles, analyserMesh;
+      let handMesh; // For visualizing the hand position
+      const particlesCount = 1000;
+      const particleSystem = {
+        particles: [],
+        geometry: null,
+        material: null,
+        mesh: null
+      };
+
+      // Helper functions
+      const closestMultiple = (value, multiple) => {
+        return Math.round(value / multiple) * multiple;
+      };
+
+      function calculateFrequency(baseFrequency, semitonesAway) {
+        const semitoneRatio = Math.pow(2, 1 / 12);
+        return baseFrequency * Math.pow(semitoneRatio, semitonesAway);
+      }
+
+      // Sound settings
+      const range = 24;
+      const baseFreq = calculateFrequency(440, -18);
+      const ratio1 = 0.24;
+      const ratio2 = 0.25 * ratio1;
+
+      // Global audio variables
+      let audioContext = null;
+      let isPlaying = false;
+      let oscillators = [];
+      let lp = null;
+      let gainNodeDry = null;
+      let gainNodeWet = null;
+      let convolver = null;
+      let analyser = null;
+      const mix = 0.6;
+
+      // Initialize Three.js
+      function initThree() {
+        // Create scene
+        scene = new THREE.Scene();
+        
+        // Create camera
+        camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 100;
+        
+        // Create renderer
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setClearColor(0x111111, 1);
+        container.appendChild(renderer.domElement);
+        
+        // Create particle system
+        initParticleSystem();
+        
+        // Create hand visualization
+        initHandMesh();
+        
+        // Handle window resize
+        window.addEventListener('resize', () => {
+          camera.aspect = window.innerWidth / window.innerHeight;
+          camera.updateProjectionMatrix();
+          renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+        
+        // Start animation loop
+        animate();
+      }
+      
+      // Create particle system
+      function initParticleSystem() {
+        particleSystem.geometry = new THREE.BufferGeometry();
+        
+        const positions = new Float32Array(particlesCount * 3);
+        const colors = new Float32Array(particlesCount * 3);
+        const sizes = new Float32Array(particlesCount);
+        
+        // Initialize particles with random positions
+        for (let i = 0; i < particlesCount; i++) {
+          const i3 = i * 3;
+          
+          // Position - spread in a sphere
+          const radius = Math.random() * 50 + 10; // Random radius between 10 and 60
+          const theta = Math.random() * Math.PI * 2;
+          const phi = Math.random() * Math.PI;
+          
+          positions[i3] = radius * Math.sin(phi) * Math.cos(theta);
+          positions[i3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
+          positions[i3 + 2] = radius * Math.cos(phi);
+          
+          // Random colors
+          colors[i3] = Math.random();
+          colors[i3 + 1] = Math.random();
+          colors[i3 + 2] = Math.random();
+          
+          // Random sizes
+          sizes[i] = 0.1 + Math.random() * 2.0;
+          
+          // Store particle data for animation
+          particleSystem.particles.push({
+            velocity: new THREE.Vector3(
+              (Math.random() - 0.5) * 0.05,
+              (Math.random() - 0.5) * 0.05,
+              (Math.random() - 0.5) * 0.05
+            ),
+            originalSize: sizes[i],
+            targetSize: sizes[i]
+          });
+        }
+        
+        particleSystem.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        particleSystem.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        particleSystem.geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+        
+        // Create material for particles
+        particleSystem.material = new THREE.PointsMaterial({
+          size: 1.0,
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.8,
+          sizeAttenuation: true
+        });
+        
+        // Create mesh
+        particleSystem.mesh = new THREE.Points(particleSystem.geometry, particleSystem.material);
+        scene.add(particleSystem.mesh);
+      }
+      
+      // Create mesh to represent hand position
+      function initHandMesh() {
+        const geometry = new THREE.SphereGeometry(2, 32, 32);
+        const material = new THREE.MeshBasicMaterial({ 
+          color: 0xff0000,
+          transparent: true,
+          opacity: 0.7
+        });
+        handMesh = new THREE.Mesh(geometry, material);
+        scene.add(handMesh);
+      }
+      
+      // Animation loop
+      function animate() {
+        requestAnimationFrame(animate);
+        
+        // Update particles
+        updateParticles();
+        
+        // Update audio analyzer visualization if playing
+        if (isPlaying && analyser) {
+          updateAudioVisualization();
+        }
+        
+        // Render scene
+        renderer.render(scene, camera);
+      }
+      
+      // Update particles based on hand position and audio
+      function updateParticles() {
+        // Get positions array for update
+        const positions = particleSystem.geometry.attributes.position.array;
+        const sizes = particleSystem.geometry.attributes.size.array;
+        const colors = particleSystem.geometry.attributes.color.array;
+        
+        // Convert screen coordinates to world coordinates
+        const worldX = (mousePos.x / window.innerWidth) * 2 - 1;
+        const worldY = -(mousePos.y / window.innerHeight) * 2 + 1;
+        
+        // Update hand mesh position
+        handMesh.position.x = worldX * 175;
+        handMesh.position.y = worldY * 110;
+        
+        // Pulse effect for hand if playing
+        if (isPlaying) {
+          handMesh.scale.x = 1 + Math.sin(Date.now() * 0.01) * 0.3;
+          handMesh.scale.y = handMesh.scale.x;
+          handMesh.scale.z = handMesh.scale.x;
+        } else {
+          handMesh.scale.set(1, 1, 1);
+        }
+        
+        // Update each particle
+        for (let i = 0; i < particlesCount; i++) {
+          const i3 = i * 3;
+          const particle = particleSystem.particles[i];
+          
+          // Update position based on velocity
+          positions[i3] += particle.velocity.x;
+          positions[i3 + 1] += particle.velocity.y;
+          positions[i3 + 2] += particle.velocity.z;
+          
+          // Influence from hand position when playing
+          if (isPlaying) {
+            // Get distance from hand
+            const dx = positions[i3] - handMesh.position.x;
+            const dy = positions[i3 + 1] - handMesh.position.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            
+            // Apply force toward hand based on distance
+            const force = 0.05 / (1 + dist * 0.1);
+            particle.velocity.x += -dx * force;
+            particle.velocity.y += -dy * force;
+            
+            // Add some randomness
+            particle.velocity.x += (Math.random() - 0.5) * 0.02;
+            particle.velocity.y += (Math.random() - 0.5) * 0.02;
+            particle.velocity.z += (Math.random() - 0.5) * 0.02;
+            
+            // Update color based on position (to create a flowing color effect)
+            colors[i3] = 0.5 + 0.5 * Math.sin(positions[i3] * 0.1 + Date.now() * 0.001);
+            colors[i3 + 1] = 0.5 + 0.5 * Math.sin(positions[i3 + 1] * 0.1 + Date.now() * 0.002);
+            colors[i3 + 2] = 0.5 + 0.5 * Math.sin(positions[i3 + 2] * 0.1 + Date.now() * 0.003);
+          }
+          
+          // Apply slight damping
+          particle.velocity.x *= 0.99;
+          particle.velocity.y *= 0.99;
+          particle.velocity.z *= 0.99;
+          
+          // Keep particles within bounds
+          const bound = 120;
+          if (Math.abs(positions[i3]) > bound) {
+            positions[i3] = Math.sign(positions[i3]) * bound;
+            particle.velocity.x *= -0.8;
+          }
+          if (Math.abs(positions[i3 + 1]) > bound) {
+            positions[i3 + 1] = Math.sign(positions[i3 + 1]) * bound;
+            particle.velocity.y *= -0.8;
+          }
+          if (Math.abs(positions[i3 + 2]) > bound) {
+            positions[i3 + 2] = Math.sign(positions[i3 + 2]) * bound;
+            particle.velocity.z *= -0.8;
+          }
+          
+          // Update size based on audio if playing
+          if (isPlaying && analyser) {
+            // Use modulo to distribute particles across frequency ranges
+            const freqIndex = i % analyser.frequencyBinCount;
+            const freqData = getAudioFrequencyData();
+            
+            if (freqData && freqData.length > 0) {
+              const value = freqData[freqIndex] / 255; // Normalize to 0-1
+              particle.targetSize = particle.originalSize * (1 + value * 3);
+            }
+          } else {
+            particle.targetSize = particle.originalSize;
+          }
+          
+          // Smoothly interpolate size
+          sizes[i] += (particle.targetSize - sizes[i]) * 0.1;
+        }
+        
+        // Tell Three.js to update the buffers
+        particleSystem.geometry.attributes.position.needsUpdate = true;
+        particleSystem.geometry.attributes.color.needsUpdate = true;
+        particleSystem.geometry.attributes.size.needsUpdate = true;
+      }
+      
+      // Update audio visualization
+      function updateAudioVisualization() {
+        if (!analyser) return;
+        
+        // Already handled in updateParticles
+      }
+      
+      // Get frequency data from analyzer
+      function getAudioFrequencyData() {
+        if (!analyser) return null;
+        
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        analyser.getByteFrequencyData(dataArray);
+        
+        return dataArray;
+      }
+
+      // Create analyzer and visualization
+      function createAnalyser() {
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.8;
+        gainNodeDry.connect(analyser);
+        gainNodeWet.connect(analyser);
+        
+        // Start visualization
+        drawSpectrum();
+      }
+
+      // Function to draw frequency spectrum
+      function drawSpectrum() {
+        if (!analyser) return;
+        
+        const spectCtx = spectrum.getContext('2d');
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        
+        function draw() {
+          requestAnimationFrame(draw);
+          
+          analyser.getByteFrequencyData(dataArray);
+          
+          spectCtx.clearRect(0, 0, spectrum.width, spectrum.height);
+          spectCtx.fillStyle = 'rgba(20, 20, 20, 0.6)';
+          spectCtx.fillRect(0, 0, spectrum.width, spectrum.height);
+          
+          const barWidth = (spectrum.width / bufferLength) * 4;
+          let barHeight;
+          let x = 0;
+          
+          for (let i = 0; i < bufferLength; i += 4) {
+            barHeight = dataArray[i] / 2;
+            
+            // Dynamic color based on pitch
+            const hue = (i / bufferLength) * 360;
+            spectCtx.fillStyle = `hsl(${hue}, 100%, 50%)`;
+            spectCtx.fillRect(x, spectrum.height - barHeight, barWidth, barHeight);
+            
+            x += barWidth + 1;
+          }
+        }
+        
+        draw();
+      }
+
+      // Function to initialize audio
+      function initAudio() {
+        try {
+          if (audioContext) return; // Prevent double initialization
+          
+          console.log("Initializing audio context...");
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          
+          // Create chord - from original code
+          const chord = [-24, 4, 7 - 12, 11, 14 - 12];
+      
+          oscillators = chord.map((note) => ({
+            note,
+            osc: audioContext.createOscillator(),
+            connected: false,
+            started: false,
+          }));
+      
+          // Setup mixing
+          gainNodeDry = audioContext.createGain();
+          gainNodeDry.gain.setValueAtTime(
+            ((1 - mix) * (0.8 * 1)) / oscillators.length,
+            audioContext.currentTime
+          );
+          gainNodeDry.connect(audioContext.destination);
+      
+          gainNodeWet = audioContext.createGain();
+          gainNodeWet.gain.setValueAtTime(
+            (mix * (0.8 * 1)) / oscillators.length,
+            audioContext.currentTime
+          );
+          gainNodeWet.connect(audioContext.destination);
+      
+          // Create effects
+          convolver = audioContext.createConvolver();
+          const createImpulseResponse = (duration, decay) => {
+            const sampleRate = audioContext.sampleRate;
+            const length = sampleRate * duration;
+            const impulse = audioContext.createBuffer(2, length, sampleRate);
+            for (let i = 0; i < 2; i++) {
+              const channelData = impulse.getChannelData(i);
+              for (let j = 0; j < length; j++) {
+                channelData[j] =
+                  (Math.random() * 2 - 1) * Math.pow(1 - j / length, decay);
+              }
+            }
+            return impulse;
+          };
+      
+          convolver.buffer = createImpulseResponse(1.0, 1.0);
+      
+          // Low-pass filter
+          lp = audioContext.createBiquadFilter();
+          lp.type = 'lowpass';
+          lp.frequency.setValueAtTime(400, audioContext.currentTime);
+          lp.connect(convolver);
+          lp.connect(gainNodeDry);
+          convolver.connect(gainNodeWet);
+      
+          // Set oscillator wave type
+          oscillators.forEach(({ osc }) => {
+            osc.type = 'sawtooth'; // Same as original
+            osc.connect(lp);
+          });
+          
+          // Create analyzer
+          createAnalyser();
+          
+          console.log("Audio initialized successfully");
+          
+          // Start animation
+          requestAnimationFrame(interpolate);
+          
+          // Update message
+          instructions.innerHTML = `
+            <h2>Synthesizer with Three.js Particles</h2>
+            <p>Audio initialized successfully!</p>
+            <p>Move your index finger to change the sound</p>
+            <p>Make a fist to play, open hand to stop</p>
+          `;
+          setTimeout(() => {
+            instructions.style.opacity = '0';
+          }, 3000);
+          
+        } catch (error) {
+          console.error("Error initializing audio:", error);
+          instructions.innerHTML = `
+            <h2>Error</h2>
+            <p>Error initializing audio: ${error.message}</p>
+          `;
+          instructions.style.color = 'red';
+        }
+      }
+
+      // Function to adjust sound parameters based on position
+      const adjust = (x, y) => {
+        if (!audioContext || !lp) return;
+        
+        const ratio = y / window.innerHeight;
+        lp.frequency.setValueAtTime(
+          200 + 4400 * Math.pow(1 - ratio, 2),
+          audioContext.currentTime
+        );
+      
+        oscillators.forEach((osc) => {
+          osc.osc.frequency.setValueAtTime(
+            calculateFrequency(baseFreq, osc.note + (range * x) / window.innerWidth),
+            audioContext.currentTime
+          );
+        });
+      
+        const value = mix * (0.8 * 1);
+        gainNodeWet.gain.setValueAtTime(
+          (value + (1.5 - value) * 1.5 * Math.pow(1 - ratio, 2)) / oscillators.length,
+          audioContext.currentTime
+        );
+        
+        // Update status
+        if (isPlaying) {
+          const freq = Math.round(200 + 4400 * Math.pow(1 - ratio, 2));
+          const pitch = Math.round((range * x) / window.innerWidth);
+          
+          statusDiv.textContent = `Filter Frequency: ${freq}Hz | Pitch Position: ${pitch}`;
+        }
+      };
+
+      // Animation function
+      const interpolate = () => {
+        const targetX = closestMultiple(mousePos.x, window.innerWidth / range);
+        const targetY = closestMultiple(mousePos.y, window.innerWidth / range);
+      
+        interpolated.x += ratio1 * (mousePos.x - interpolated.x);
+        interpolated.y += ratio1 * (mousePos.y - interpolated.y);
+      
+        distance.x += ratio2 * (targetX - interpolated.x - distance.x);
+      
+        const x = distance.x + interpolated.x;
+        const y = interpolated.y;
+      
+        adjust(x, y);
+      
+        requestAnimationFrame(interpolate);
+      };
+
+      // Function to start the sound
+      function startSound() {
+        // Initialize audio if it's the first time
+        if (!audioContext) {
+          initAudio();
+        }
+        
+        // Try to resume the audio context if it's suspended
+        if (audioContext && audioContext.state === 'suspended') {
+          audioContext.resume().then(() => {
+            console.log("AudioContext resumed successfully");
+          }).catch(err => {
+            console.error("Failed to resume AudioContext:", err);
+          });
+        }
+        
+        if (!isPlaying && audioContext) {
+          try {
+            oscillators.forEach((osc) => {
+              if (!osc.started) {
+                osc.osc.start();
+                osc.started = true;
+              }
+      
+              osc.osc.connect(lp);
+              osc.connected = true;
+            });
+      
+            isPlaying = true;
+            console.log("Sound playing");
+          } catch (error) {
+            console.error("Error starting sound:", error);
+          }
+        }
+      }
+
+      // Function to stop the sound
+      function stopSound() {
+        if (isPlaying && audioContext) {
+          try {
+            oscillators.forEach((osc) => {
+              if (osc.connected) {
+                osc.osc.disconnect(lp);
+                osc.connected = false;
+              }
+            });
+      
+            isPlaying = false;
+            console.log("Sound stopped");
+          } catch (error) {
+            console.error("Error stopping sound:", error);
+          }
+        }
+      }
+
+      // Initialize MediaPipe and camera
+      async function initHandTracking() {
+        try {
+          statusDiv.textContent = "Initializing hand tracking...";
+          
+          // Now that scripts are loaded, we can access the MediaPipe objects
+          const hands = new window.Hands({
+            locateFile: (file) => {
+              return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }
+          });
+          
+          hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.8,
+            minTrackingConfidence: 0.8
+          });
+          
+          hands.onResults(onHandResults);
+          
+          // Camera setup
+          const camera = new window.Camera(videoElement, {
+            onFrame: async () => {
+              await hands.send({image: videoElement});
+            },
+            width: 2560,
+            height: 1440
+          });
+          
+          await camera.start();
+          statusDiv.textContent = "Camera started, show your hand";
+          
+          console.log("MediaPipe and camera initialized successfully");
+        } catch (error) {
+          console.error("Error during hand tracking initialization:", error);
+          statusDiv.textContent = "Hand tracking failed, using mouse fallback";
+          setupMouseFallback();
+        }
+      }
+
+      // Hand tracking results handler
+      function onHandResults(results) {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+          isHandVisible = true;
+          
+          // Get index finger tip position (landmark 8)
+          const indexFinger = results.multiHandLandmarks[0][8];
+          
+          // Map to screen coordinates - FIX: Invert X-coordinate to fix mirroring
+          // Since camera is mirrored, we need to flip the X coordinate (1 - x)
+          mousePos.x = (1 - indexFinger.x) * window.innerWidth; // Fix mirroring
+          mousePos.y = indexFinger.y * window.innerHeight;
+          
+          // Check if hand is closed (measure distance between thumb tip and index finger tip)
+          const thumbTip = results.multiHandLandmarks[0][4];
+          // Also adjust the thumb x-coordinate for distance calculation
+          const distance = Math.sqrt(
+            Math.pow((1 - thumbTip.x) - mousePos.x / window.innerWidth, 2) + 
+            Math.pow(thumbTip.y - indexFinger.y, 2)
+          );
+          
+          // If thumb and index finger are close, consider hand closed
+          const wasClosed = isHandClosed;
+          isHandClosed = distance < 0.1;
+          
+          // Toggle sound based on hand gesture
+          if (isHandClosed && !wasClosed) {
+            startSound();
+            statusDiv.textContent = "Sound playing - make a fist to continue";
+          } else if (!isHandClosed && wasClosed) {
+            stopSound();
+            statusDiv.textContent = "Sound stopped - open hand detected";
+          }
+          
+          // Handle auto-initialization of audio
+          if (!audioContext && isHandVisible) {
+            initAudio();
+          }
+        } else {
+          isHandVisible = false;
+          if (isPlaying) {
+            stopSound();
+            statusDiv.textContent = "Hand not visible - show your hand to continue";
+          }
+        }
+      }
+
+      // Manual initialization for testing (use mouse instead of hand tracking)
+      function setupMouseFallback() {
+        document.addEventListener('mousemove', (e) => {
+          mousePos.x = e.clientX;
+          mousePos.y = e.clientY;
+        });
+        
+        document.addEventListener('mousedown', () => {
+          startSound();
+          statusDiv.textContent = "Sound playing (mouse control)";
+        });
+        
+        document.addEventListener('mouseup', () => {
+          stopSound();
+          statusDiv.textContent = "Sound stopped (mouse control)";
+        });
+        
+        statusDiv.textContent = "Mouse fallback active - click to play sound";
+      }
+
+      // Initialize the Three.js scene
+      initThree();
+      
+      // Initialize MediaPipe hand tracking
+      initHandTracking().catch(err => {
+        console.error("Failed to initialize MediaPipe:", err);
+        statusDiv.textContent = "Hand tracking failed, using mouse fallback";
+        setupMouseFallback();
+      });
+
+      // Resize handler
+      window.addEventListener('resize', () => {
+        // Three.js resize handled in initThree
+      });
+
+      // Audio check message
+      console.log("Three.js Hand-Controlled Audio Visualizer loaded. Show your hand to initialize audio.");
+    }
+  </script>
+</body>
+</html>
