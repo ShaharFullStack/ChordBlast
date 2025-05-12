@@ -338,20 +338,32 @@
           
           // Influence from hand position when playing
           if (isPlaying) {
-            // Get distance from hand
+            // Get distance from hand in 3D space (including Z axis)
             const dx = positions[i3] - handMesh.position.x;
             const dy = positions[i3 + 1] - handMesh.position.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
+            const dz = positions[i3 + 2]; // Distance from the z=0 plane where hand is
             
-            // Apply force toward hand based on distance
-            const force = 0.05 / (1 + dist * 0.1);
-            particle.velocity.x += -dx * force;
-            particle.velocity.y += -dy * force;
+            // Calculate 3D distance for spherical attraction
+            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
             
-            // Add some randomness
-            particle.velocity.x += (Math.random() - 0.5) * 0.02;
-            particle.velocity.y += (Math.random() - 0.5) * 0.02;
-            particle.velocity.z += (Math.random() - 0.5) * 0.02;
+            // Modified force calculation to create a ball effect
+            // Use a spherical attraction model instead of cylindrical
+            const targetRadius = 30; // Radius of our target ball
+            const forceStrength = 0.08; // Strength of the attraction
+            
+            // Calculate force based on distance from the target sphere
+            const forceFactor = forceStrength * (1 - Math.min(1, targetRadius / Math.max(1, dist)));
+            
+            // Apply force toward hand - equally in all 3 dimensions
+            particle.velocity.x += -dx * forceFactor;
+            particle.velocity.y += -dy * forceFactor;
+            particle.velocity.z += -dz * forceFactor;
+            
+            // Add some randomness - more controlled to maintain ball shape
+            const randomFactor = 0.01;
+            particle.velocity.x += (Math.random() - 0.5) * randomFactor;
+            particle.velocity.y += (Math.random() - 0.5) * randomFactor;
+            particle.velocity.z += (Math.random() - 0.5) * randomFactor;
             
             // Update color based on position (to create a flowing color effect)
             colors[i3] = 0.5 + 0.5 * Math.sin(positions[i3] * 0.1 + Date.now() * 0.001);
